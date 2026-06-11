@@ -122,6 +122,13 @@ class OpenAIServerConversationTracker:
     server_tool_call_ids: set[str] = field(default_factory=set)
     server_output_fingerprints: set[str] = field(default_factory=set)
 
+    # Stable call ids for tool outputs we have already delivered. Tool outputs are deduped by
+    # their call_id rather than object identity, because a freshly built output object can reuse
+    # the memory address (and therefore the id()) of a garbage-collected item recorded in
+    # sent_items/server_items. Keying on call_id keeps such an output from being dropped and
+    # leaving its function_call unanswered.
+    sent_tool_call_output_ids: set[str] = field(default_factory=set)
+
     # Content-based dedupe for resume/retry paths where objects are reconstructed.
     sent_item_fingerprints: set[str] = field(default_factory=set)
     restored_anonymous_tool_search_fingerprints: set[str] = field(default_factory=set)
@@ -376,6 +383,11 @@ class OpenAIServerConversationTracker:
             if fp:
                 delivered_by_content.add(fp)
                 self.sent_item_fingerprints.add(fp)
+            output_call_id = _extract_call_id(source_item)
+            if isinstance(output_call_id, str) and _has_output_payload(source_item):
+                # Record the call_id so this output is deduped by its stable identity on later
+                # turns rather than by object identity. See prepare_input for why id() is unsafe.
+                self.sent_tool_call_output_ids.add(output_call_id)
 
         if not self.remaining_initial_input:
             return
@@ -406,6 +418,9 @@ class OpenAIServerConversationTracker:
             fp = _fingerprint_for_tracker(source_item)
             if fp:
                 self.sent_item_fingerprints.discard(fp)
+            output_call_id = _extract_call_id(source_item)
+            if isinstance(output_call_id, str) and _has_output_payload(source_item):
+                self.sent_tool_call_output_ids.discard(output_call_id)
 
         if not rewind_items:
             return
@@ -462,15 +477,22 @@ class OpenAIServerConversationTracker:
 
             call_id = _extract_call_id(raw_item)
             has_output_payload = _has_output_payload(raw_item)
-            if (
-                isinstance(call_id, str)
-                and has_output_payload
-                and call_id in self.server_tool_call_ids
-            ):
+            is_tool_call_output = isinstance(call_id, str) and has_output_payload
+            if is_tool_call_output and call_id in self.server_tool_call_ids:
                 continue
 
             raw_item_id = id(raw_item)
-            if raw_item_id in self.sent_items or raw_item_id in self.server_items:
+            id_already_seen = raw_item_id in self.sent_items or raw_item_id in self.server_items
+            if id_already_seen and (
+                not is_tool_call_output or call_id in self.sent_tool_call_output_ids
+            ):
+                # Object identity dedupes items we have already delivered or that the server
+                # returned. For a tool output, identity alone is not trustworthy: CPython can
+                # recycle the address of a garbage-collected item into a brand-new output, so a
+                # stale id() in sent_items/server_items could otherwise drop a freshly computed
+                # output and leave its function_call unanswered (provider 400 "No tool output
+                # found for function call ..."). We therefore require the output's stable call_id
+                # to be one we have actually delivered before trusting the identity match.
                 continue
 
             converted_input_item = run_item_to_input_item(run_item, self.reasoning_item_id_policy)

@@ -965,3 +965,75 @@ async def test_run_single_turn_streamed_seeds_hosted_mcp_metadata_from_pre_step_
     assert len(tool_call_events) == 1
     assert tool_call_events[0].description == "Search the docs."
     assert tool_call_events[0].title == "Search Docs"
+
+
+@pytest.mark.parametrize("stale_set_name", ["sent_items", "server_items"])
+def test_prepare_input_keeps_tool_output_when_id_collides_with_stale_object(
+    stale_set_name: str,
+) -> None:
+    """A recycled object address must not drop a freshly computed tool output.
+
+    CPython reuses the memory address of a garbage-collected object for later allocations, so a
+    brand-new ``function_call_output`` can have the same ``id()`` as a long-gone item that was
+    recorded in ``sent_items``/``server_items``. The old identity-based dedupe then skipped the
+    new output, leaving its ``function_call`` unanswered and triggering the provider error
+    ``No tool output found for function call ...``. Tool outputs are now deduped by their stable
+    ``call_id`` instead, so the address collision is harmless.
+    """
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp-1")
+
+    output_raw_item: dict[str, Any] = {
+        "type": "function_call_output",
+        "call_id": "call_FRESH",
+        "output": "42",
+    }
+    generated_items = [DummyRunItem(output_raw_item, type="function_call_output_item")]
+
+    # Simulate the recycled address: an unrelated object once lived here and was recorded as sent
+    # or server-acknowledged before it was garbage collected.
+    getattr(tracker, stale_set_name).add(id(output_raw_item))
+
+    prepared = tracker.prepare_input(
+        original_input="please run the tool",
+        generated_items=cast(list[Any], generated_items),
+    )
+
+    prepared_output_call_ids = [
+        item.get("call_id")
+        for item in prepared
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    ]
+    assert "call_FRESH" in prepared_output_call_ids
+
+
+def test_prepare_input_dedupes_already_sent_tool_output_by_call_id() -> None:
+    """An output that was actually delivered is still skipped on later turns.
+
+    Deduping by ``call_id`` must not regress the common case: once an output has been sent, the
+    same accumulated item reappears in ``generated_items`` on every subsequent turn and must not
+    be resent. ``mark_input_as_sent`` records the output's ``call_id`` so ``prepare_input`` can
+    drop it without relying on the fragile ``id()`` check.
+    """
+    tracker = OpenAIServerConversationTracker(previous_response_id="resp-1")
+
+    output_raw_item: dict[str, Any] = {
+        "type": "function_call_output",
+        "call_id": "call_X",
+        "output": "42",
+    }
+    generated_items = [DummyRunItem(output_raw_item, type="function_call_output_item")]
+
+    first = tracker.prepare_input(
+        original_input="please run the tool",
+        generated_items=cast(list[Any], generated_items),
+    )
+    assert any(isinstance(item, dict) and item.get("call_id") == "call_X" for item in first)
+
+    tracker.mark_input_as_sent(first)
+    assert "call_X" in tracker.sent_tool_call_output_ids
+
+    second = tracker.prepare_input(
+        original_input="please run the tool",
+        generated_items=cast(list[Any], generated_items),
+    )
+    assert all(not (isinstance(item, dict) and item.get("call_id") == "call_X") for item in second)
